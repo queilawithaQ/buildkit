@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"time"
 
+	fuseoverlayfs "github.com/AkihiroSuda/containerd-fuse-overlayfs"
 	"github.com/BurntSushi/toml"
 	snapshotsapi "github.com/containerd/containerd/api/services/snapshots/v1"
 	"github.com/containerd/containerd/defaults"
@@ -18,14 +19,12 @@ import (
 	ctdsnapshot "github.com/containerd/containerd/snapshots"
 	"github.com/containerd/containerd/snapshots/native"
 	"github.com/containerd/containerd/snapshots/overlay"
-	"github.com/containerd/containerd/snapshots/overlay/overlayutils"
 	snproxy "github.com/containerd/containerd/snapshots/proxy"
 	"github.com/containerd/containerd/sys"
-	fuseoverlayfs "github.com/containerd/fuse-overlayfs-snapshotter"
-	sgzfs "github.com/containerd/stargz-snapshotter/fs"
-	sgzconf "github.com/containerd/stargz-snapshotter/fs/config"
-	sgzsource "github.com/containerd/stargz-snapshotter/fs/source"
 	remotesn "github.com/containerd/stargz-snapshotter/snapshot"
+	"github.com/containerd/stargz-snapshotter/stargz"
+	sgzconf "github.com/containerd/stargz-snapshotter/stargz/config"
+	sgzsource "github.com/containerd/stargz-snapshotter/stargz/source"
 	"github.com/moby/buildkit/cmd/buildkitd/config"
 	"github.com/moby/buildkit/executor/oci"
 	"github.com/moby/buildkit/util/network/cniprovider"
@@ -36,7 +35,6 @@ import (
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
-	"golang.org/x/sync/semaphore"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/backoff"
 )
@@ -277,12 +275,7 @@ func ociWorkerInitializer(c *cli.Context, common workerInitializerOpt) ([]worker
 		},
 	}
 
-	var parallelismSem *semaphore.Weighted
-	if cfg.MaxParallelism > 0 {
-		parallelismSem = semaphore.NewWeighted(int64(cfg.MaxParallelism))
-	}
-
-	opt, err := runc.NewWorkerOpt(common.config.Root, snFactory, cfg.Rootless, processMode, cfg.Labels, idmapping, nc, dns, cfg.Binary, cfg.ApparmorProfile, parallelismSem)
+	opt, err := runc.NewWorkerOpt(common.config.Root, snFactory, cfg.Rootless, processMode, cfg.Labels, idmapping, nc, dns, cfg.Binary, cfg.ApparmorProfile)
 	if err != nil {
 		return nil, err
 	}
@@ -338,7 +331,7 @@ func snapshotterFactory(commonRoot string, cfg config.OCIConfig, hosts docker.Re
 	}
 
 	if name == "auto" {
-		if err := overlayutils.Supported(commonRoot); err == nil {
+		if err := overlay.Supported(commonRoot); err == nil {
 			name = "overlayfs"
 		} else {
 			logrus.Debugf("auto snapshotter: overlayfs is not available for %s, trying fuse-overlayfs: %v", commonRoot, err)
@@ -391,9 +384,9 @@ func snapshotterFactory(commonRoot string, cfg config.OCIConfig, hosts docker.Re
 			}
 		}
 		snFactory.New = func(root string) (ctdsnapshot.Snapshotter, error) {
-			fs, err := sgzfs.NewFilesystem(filepath.Join(root, "stargz"),
+			fs, err := stargz.NewFilesystem(filepath.Join(root, "stargz"),
 				sgzCfg,
-				sgzfs.WithGetSources(
+				stargz.WithGetSources(
 					// provides source info based on the registry config and
 					// default labels.
 					sgzsource.FromDefaultLabels(sgzhosts),

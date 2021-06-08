@@ -91,8 +91,6 @@ type OCIConfig struct {
 	// ApparmorProfile is the name of the apparmor profile that should be used to constrain build containers.
 	// The profile should already be loaded (by a higher level system) before creating a worker.
 	ApparmorProfile string `toml:"apparmor-profile"`
-
-	MaxParallelism int `toml:"max-parallelism"`
 }
 
 type ContainerdConfig struct {
@@ -108,8 +106,6 @@ type ContainerdConfig struct {
 	// ApparmorProfile is the name of the apparmor profile that should be used to constrain build containers.
 	// The profile should already be loaded (by a higher level system) before creating a worker.
 	ApparmorProfile string `toml:"apparmor-profile"`
-
-	MaxParallelism int `toml:"max-parallelism"`
 }
 
 type GCPolicy struct {

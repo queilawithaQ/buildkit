@@ -73,7 +73,6 @@ func TestIntegration(t *testing.T) {
 		testRelativeWorkDir,
 		testFileOpMkdirMkfile,
 		testFileOpCopyRm,
-		testFileOpCopyIncludeExclude,
 		testFileOpRmWildcard,
 		testCallDiskUsage,
 		testBuildMultiMount,
@@ -1127,116 +1126,11 @@ func testFileOpCopyRm(t *testing.T, sb integration.Sandbox) {
 	require.Equal(t, []byte("bar0"), dt)
 
 	_, err = os.Stat(filepath.Join(destDir, "out/foo"))
-	require.ErrorIs(t, err, os.ErrNotExist)
+	require.Equal(t, true, errors.Is(err, os.ErrNotExist))
 
 	dt, err = ioutil.ReadFile(filepath.Join(destDir, "file2"))
 	require.NoError(t, err)
 	require.Equal(t, []byte("file2"), dt)
-}
-
-func testFileOpCopyIncludeExclude(t *testing.T, sb integration.Sandbox) {
-	requiresLinux(t)
-	c, err := New(context.TODO(), sb.Address())
-	require.NoError(t, err)
-	defer c.Close()
-
-	dir, err := tmpdir(
-		fstest.CreateFile("myfile", []byte("data0"), 0600),
-		fstest.CreateDir("sub", 0700),
-		fstest.CreateFile("sub/foo", []byte("foo0"), 0600),
-		fstest.CreateFile("sub/bar", []byte("bar0"), 0600),
-	)
-	require.NoError(t, err)
-	defer os.RemoveAll(dir)
-
-	st := llb.Scratch().File(
-		llb.Copy(
-			llb.Local("mylocal"), "/", "/", &llb.CopyInfo{
-				IncludePatterns: []string{"sub/*"},
-				ExcludePatterns: []string{"sub/bar"},
-			},
-		),
-	)
-
-	busybox := llb.Image("busybox:latest")
-	run := func(cmd string) {
-		st = busybox.Run(llb.Shlex(cmd), llb.Dir("/wd")).AddMount("/wd", st)
-	}
-	run(`sh -c "cat /dev/urandom | head -c 100 | sha256sum > unique"`)
-
-	def, err := st.Marshal(context.TODO())
-	require.NoError(t, err)
-
-	destDir, err := ioutil.TempDir("", "buildkit")
-	require.NoError(t, err)
-	defer os.RemoveAll(destDir)
-
-	_, err = c.Solve(context.TODO(), def, SolveOpt{
-		Exports: []ExportEntry{
-			{
-				Type:      ExporterLocal,
-				OutputDir: destDir,
-			},
-		},
-		LocalDirs: map[string]string{
-			"mylocal": dir,
-		},
-	}, nil)
-	require.NoError(t, err)
-
-	dt, err := ioutil.ReadFile(filepath.Join(destDir, "sub", "foo"))
-	require.NoError(t, err)
-	require.Equal(t, []byte("foo0"), dt)
-
-	for _, name := range []string{"myfile", "sub/bar"} {
-		_, err = os.Stat(filepath.Join(destDir, name))
-		require.ErrorIs(t, err, os.ErrNotExist)
-	}
-
-	randBytes, err := ioutil.ReadFile(filepath.Join(destDir, "unique"))
-	require.NoError(t, err)
-
-	// Create additional file which doesn't match the include pattern, and make
-	// sure this doesn't invalidate the cache.
-
-	err = fstest.Apply(fstest.CreateFile("unmatchedfile", []byte("data1"), 0600)).Apply(dir)
-	require.NoError(t, err)
-
-	st = llb.Scratch().File(
-		llb.Copy(
-			llb.Local("mylocal"), "/", "/", &llb.CopyInfo{
-				IncludePatterns: []string{"sub/*"},
-				ExcludePatterns: []string{"sub/bar"},
-			},
-		),
-	)
-
-	run(`sh -c "cat /dev/urandom | head -c 100 | sha256sum > unique"`)
-
-	def, err = st.Marshal(context.TODO())
-	require.NoError(t, err)
-
-	destDir, err = ioutil.TempDir("", "buildkit")
-	require.NoError(t, err)
-	defer os.RemoveAll(destDir)
-
-	_, err = c.Solve(context.TODO(), def, SolveOpt{
-		Exports: []ExportEntry{
-			{
-				Type:      ExporterLocal,
-				OutputDir: destDir,
-			},
-		},
-		LocalDirs: map[string]string{
-			"mylocal": dir,
-		},
-	}, nil)
-	require.NoError(t, err)
-
-	randBytes2, err := ioutil.ReadFile(filepath.Join(destDir, "unique"))
-	require.NoError(t, err)
-
-	require.Equal(t, randBytes, randBytes2)
 }
 
 // testFileOpInputSwap is a regression test that cache is invalidated when subset of fileop is built
@@ -1320,10 +1214,10 @@ func testFileOpRmWildcard(t *testing.T, sb integration.Sandbox) {
 	require.Equal(t, true, fi.IsDir())
 
 	_, err = os.Stat(filepath.Join(destDir, "foo/target"))
-	require.ErrorIs(t, err, os.ErrNotExist)
+	require.Equal(t, true, errors.Is(err, os.ErrNotExist))
 
 	_, err = os.Stat(filepath.Join(destDir, "bar/target"))
-	require.ErrorIs(t, err, os.ErrNotExist)
+	require.Equal(t, true, errors.Is(err, os.ErrNotExist))
 }
 
 func testCallDiskUsage(t *testing.T, sb integration.Sandbox) {
@@ -2234,33 +2128,15 @@ func testStargzLazyPull(t *testing.T, sb integration.Sandbox) {
 	}
 	require.NoError(t, err)
 
-	var (
-		imageService = client.ImageService()
-		contentStore = client.ContentStore()
-		ctx          = namespaces.WithNamespace(context.Background(), "buildkit")
-	)
+	// Prepare stargz image
+	sgzImage := registry + "/stargz/alpine:latest"
+	err = exec.Command("ctr-remote", "image", "optimize",
+		"--period=1", "alpine:latest", sgzImage).Run()
+	require.NoError(t, err)
 
 	c, err := New(context.TODO(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
-
-	// Prepare stargz image
-	orgImage := "docker.io/library/alpine:latest"
-	sgzImage := registry + "/stargz/alpine:latest"
-	ctrRemoteCommonArg := []string{"--namespace", "buildkit", "--address", cdAddress}
-	err = exec.Command("ctr-remote", append(ctrRemoteCommonArg, "i", "pull", orgImage)...).Run()
-	require.NoError(t, err)
-	err = exec.Command("ctr-remote", append(ctrRemoteCommonArg, "i", "optimize", "--oci", "--period=1", orgImage, sgzImage)...).Run()
-	require.NoError(t, err)
-	err = exec.Command("ctr-remote", append(ctrRemoteCommonArg, "i", "push", "--plain-http", sgzImage)...).Run()
-	require.NoError(t, err)
-
-	// clear all local state out
-	err = imageService.Delete(ctx, orgImage, images.SynchronousDelete())
-	require.NoError(t, err)
-	err = imageService.Delete(ctx, sgzImage, images.SynchronousDelete())
-	require.NoError(t, err)
-	checkAllReleasable(t, c, sb, true)
 
 	// stargz layers should be lazy even for executing something on them
 	def, err := llb.Image(sgzImage).
@@ -2281,6 +2157,12 @@ func testStargzLazyPull(t *testing.T, sb integration.Sandbox) {
 	}, nil)
 	require.NoError(t, err)
 
+	var (
+		imageService = client.ImageService()
+		contentStore = client.ContentStore()
+		ctx          = namespaces.WithNamespace(context.Background(), "buildkit")
+	)
+
 	img, err := imageService.Get(ctx, target)
 	require.NoError(t, err)
 
@@ -2292,7 +2174,7 @@ func testStargzLazyPull(t *testing.T, sb integration.Sandbox) {
 	var sgzLayers []ocispec.Descriptor
 	for _, layer := range manifest.Layers[:len(manifest.Layers)-1] {
 		_, err = contentStore.Info(ctx, layer.Digest)
-		require.ErrorIs(t, err, ctderrdefs.ErrNotFound, "unexpected error %v", err)
+		require.True(t, errors.Is(err, ctderrdefs.ErrNotFound), "unexpected error %v", err)
 		sgzLayers = append(sgzLayers, layer)
 	}
 	require.NotEqual(t, 0, len(sgzLayers), "no layer can be used for checking lazypull")
@@ -2425,7 +2307,7 @@ func testLazyImagePush(t *testing.T, sb integration.Sandbox) {
 
 	for _, layer := range manifest.Layers {
 		_, err = contentStore.Info(ctx, layer.Digest)
-		require.ErrorIs(t, err, ctderrdefs.ErrNotFound, "unexpected error %v", err)
+		require.True(t, errors.Is(err, ctderrdefs.ErrNotFound), "unexpected error %v", err)
 	}
 
 	// clear all local state out again
@@ -2457,7 +2339,7 @@ func testLazyImagePush(t *testing.T, sb integration.Sandbox) {
 
 	for _, layer := range manifest.Layers {
 		_, err = contentStore.Info(ctx, layer.Digest)
-		require.ErrorIs(t, err, ctderrdefs.ErrNotFound, "unexpected error %v", err)
+		require.True(t, errors.Is(err, ctderrdefs.ErrNotFound), "unexpected error %v", err)
 	}
 
 	// check that a subsequent build can use the previously lazy image in an exec
@@ -3283,13 +3165,12 @@ func testProxyEnv(t *testing.T, sb integration.Sandbox) {
 	defer c.Close()
 
 	base := llb.Image("docker.io/library/busybox:latest").Dir("/out")
-	cmd := `sh -c "echo -n $HTTP_PROXY-$HTTPS_PROXY-$NO_PROXY-$no_proxy-$ALL_PROXY-$all_proxy > env"`
+	cmd := `sh -c "echo -n $HTTP_PROXY-$HTTPS_PROXY-$NO_PROXY-$no_proxy > env"`
 
 	st := base.Run(llb.Shlex(cmd), llb.WithProxy(llb.ProxyEnv{
 		HTTPProxy:  "httpvalue",
 		HTTPSProxy: "httpsvalue",
 		NoProxy:    "noproxyvalue",
-		AllProxy:   "allproxyvalue",
 	}))
 	out := st.AddMount("/out", llb.Scratch())
 
@@ -3312,7 +3193,7 @@ func testProxyEnv(t *testing.T, sb integration.Sandbox) {
 
 	dt, err := ioutil.ReadFile(filepath.Join(destDir, "env"))
 	require.NoError(t, err)
-	require.Equal(t, string(dt), "httpvalue-httpsvalue-noproxyvalue-noproxyvalue-allproxyvalue-allproxyvalue")
+	require.Equal(t, string(dt), "httpvalue-httpsvalue-noproxyvalue-noproxyvalue")
 
 	// repeat to make sure proxy doesn't change cache
 	st = base.Run(llb.Shlex(cmd), llb.WithProxy(llb.ProxyEnv{
@@ -3340,7 +3221,7 @@ func testProxyEnv(t *testing.T, sb integration.Sandbox) {
 
 	dt, err = ioutil.ReadFile(filepath.Join(destDir, "env"))
 	require.NoError(t, err)
-	require.Equal(t, string(dt), "httpvalue-httpsvalue-noproxyvalue-noproxyvalue-allproxyvalue-allproxyvalue")
+	require.Equal(t, string(dt), "httpvalue-httpsvalue-noproxyvalue-noproxyvalue")
 }
 
 func requiresLinux(t *testing.T) {
