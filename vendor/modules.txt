@@ -257,7 +257,7 @@ github.com/hanwen/go-fuse/v2/splice
 github.com/hashicorp/go-immutable-radix
 # github.com/hashicorp/golang-lru v0.5.3
 github.com/hashicorp/golang-lru/simplelru
-# github.com/ishidawataru/sctp v0.0.0-20191218070446-00ab2ac2db07
+# github.com/ishidawataru/sctp v0.0.0-20210226210310-f2269e66cdee
 github.com/ishidawataru/sctp
 # github.com/jaguilar/vt100 v0.0.0-20150826170717-2703a27b14ea => github.com/tonistiigi/vt100 v0.0.0-20190402012908-ad4c4a574305
 github.com/jaguilar/vt100
