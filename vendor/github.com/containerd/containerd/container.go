@@ -32,7 +32,7 @@ import (
 	"github.com/containerd/containerd/images"
 	"github.com/containerd/containerd/oci"
 	"github.com/containerd/containerd/runtime/v2/runc/options"
-	"github.com/containerd/fifo"
+	"github.com/containerd/containerd/sys"
 	"github.com/containerd/typeurl"
 	prototypes "github.com/gogo/protobuf/types"
 	ver "github.com/opencontainers/image-spec/specs-go"
@@ -435,12 +435,12 @@ func loadFifos(response *tasks.GetResponse) *cio.FIFOSet {
 			err  error
 			dirs = map[string]struct{}{}
 		)
-		for _, f := range fifos {
-			if isFifo, _ := fifo.IsFifo(f); isFifo {
-				if rerr := os.Remove(f); err == nil {
+		for _, fifo := range fifos {
+			if isFifo, _ := sys.IsFifo(fifo); isFifo {
+				if rerr := os.Remove(fifo); err == nil {
 					err = rerr
 				}
-				dirs[filepath.Dir(f)] = struct{}{}
+				dirs[filepath.Dir(fifo)] = struct{}{}
 			}
 		}
 		for dir := range dirs {

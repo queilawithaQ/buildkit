@@ -29,8 +29,7 @@ import (
 // SetXAttr sets the xatter for the file
 func SetXAttr(name, key, value string) Applier {
 	return applyFn(func(root string) error {
-		path := filepath.Join(root, name)
-		return sysx.LSetxattr(path, key, []byte(value), 0)
+		return sysx.LSetxattr(name, key, []byte(value), 0)
 	})
 }
 
