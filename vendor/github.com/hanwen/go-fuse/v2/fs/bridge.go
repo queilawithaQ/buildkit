@@ -7,6 +7,7 @@ package fs
 import (
 	"context"
 	"log"
+	"math/rand"
 	"sync"
 	"syscall"
 	"time"
@@ -32,12 +33,6 @@ type fileEntry struct {
 	dirStream   DirStream
 	hasOverflow bool
 	overflow    fuse.DirEntry
-	// dirOffset is the current location in the directory (see `telldir(3)`).
-	// The value is equivalent to `d_off` (see `getdents(2)`) of the last
-	// directory entry sent to the kernel so far.
-	// If `dirOffset` and `fuse.DirEntryList.offset` disagree, then a
-	// directory seek has taken place.
-	dirOffset uint64
 
 	wg sync.WaitGroup
 }
@@ -60,27 +55,9 @@ type rawBridge struct {
 
 	// mu protects the following data.  Locks for inodes must be
 	// taken before rawBridge.mu
-	mu sync.Mutex
-
-	// stableAttrs is used to detect already-known nodes and hard links by
-	// looking at:
-	// 1) file type ......... StableAttr.Mode
-	// 2) inode number ...... StableAttr.Ino
-	// 3) generation number . StableAttr.Gen
-	stableAttrs  map[StableAttr]*Inode
+	mu           sync.Mutex
+	nodes        map[uint64]*Inode
 	automaticIno uint64
-
-	// The *Node ID* is an arbitrary uint64 identifier chosen by the FUSE library.
-	// It is used the identify *nodes* (files/directories/symlinks/...) in the
-	// communication between the FUSE library and the Linux kernel.
-	//
-	// The kernelNodeIds map translates between the NodeID and the corresponding
-	// go-fuse Inode object.
-	//
-	// A simple incrementing counter is used as the NodeID (see `nextNodeID`).
-	kernelNodeIds map[uint64]*Inode
-	// nextNodeID is the next free NodeID. Increment after copying the value.
-	nextNodeId uint64
 
 	files     []*fileEntry
 	freeFiles []uint32
@@ -100,26 +77,55 @@ func (b *rawBridge) newInodeUnlocked(ops InodeEmbedder, id StableAttr, persisten
 		return ops.embed()
 	}
 
-	// Only the file type bits matter
-	id.Mode = id.Mode & syscall.S_IFMT
-	if id.Mode == 0 {
-		id.Mode = fuse.S_IFREG
-	}
-
 	if id.Ino == 0 {
-		// Find free inode number.
 		for {
 			id.Ino = b.automaticIno
 			b.automaticIno++
-			_, ok := b.stableAttrs[id]
+			_, ok := b.nodes[id.Ino]
 			if !ok {
 				break
 			}
 		}
 	}
 
-	initInode(ops.embed(), ops, id, b, persistent, b.nextNodeId)
-	b.nextNodeId++
+	// Only the file type bits matter
+	id.Mode = id.Mode & syscall.S_IFMT
+	if id.Mode == 0 {
+		id.Mode = fuse.S_IFREG
+	}
+
+	// the same node can be looked up through 2 paths in parallel, eg.
+	//
+	//	    root
+	//	    /  \
+	//	  dir1 dir2
+	//	    \  /
+	//	    file
+	//
+	// dir1.Lookup("file") and dir2.Lookup("file") are executed
+	// simultaneously.  The matching StableAttrs ensure that we return the
+	// same node.
+	var t time.Duration
+	t0 := time.Now()
+	for i := 1; true; i++ {
+		old := b.nodes[id.Ino]
+		if old == nil {
+			break
+		}
+		if old.stableAttr == id {
+			return old
+		}
+		b.mu.Unlock()
+
+		t = expSleep(t)
+		if i%5000 == 0 {
+			b.logf("blocked for %.0f seconds waiting for FORGET on i%d", time.Since(t0).Seconds(), id.Ino)
+		}
+		b.mu.Lock()
+	}
+
+	b.nodes[id.Ino] = ops.embed()
+	initInode(ops.embed(), ops, id, b, persistent)
 	return ops.embed()
 }
 
@@ -127,6 +133,21 @@ func (b *rawBridge) logf(format string, args ...interface{}) {
 	if b.options.Logger != nil {
 		b.options.Logger.Printf(format, args...)
 	}
+}
+
+// expSleep sleeps for time `t` and returns an exponentially increasing value
+// for the next sleep time, capped at 1 ms.
+func expSleep(t time.Duration) time.Duration {
+	if t == 0 {
+		return time.Microsecond
+	}
+	time.Sleep(t)
+	// Next sleep is between t and 2*t
+	t += time.Duration(rand.Int63n(int64(t)))
+	if t >= time.Millisecond {
+		return time.Millisecond
+	}
+	return t
 }
 
 func (b *rawBridge) newInode(ctx context.Context, ops InodeEmbedder, id StableAttr, persistent bool) *Inode {
@@ -142,81 +163,34 @@ func (b *rawBridge) newInode(ctx context.Context, ops InodeEmbedder, id StableAt
 }
 
 // addNewChild inserts the child into the tree. Returns file handle if file != nil.
-// Unless fileFlags has the syscall.O_EXCL bit set, child.stableAttr will be used
-// to find an already-known node. If one is found, `child` is ignored and the
-// already-known one is used. The node that was actually used is returned.
-func (b *rawBridge) addNewChild(parent *Inode, name string, child *Inode, file FileHandle, fileFlags uint32, out *fuse.EntryOut) (selected *Inode, fh uint32) {
+func (b *rawBridge) addNewChild(parent *Inode, name string, child *Inode, file FileHandle, fileFlags uint32, out *fuse.EntryOut) uint32 {
 	if name == "." || name == ".." {
 		log.Panicf("BUG: tried to add virtual entry %q to the actual tree", name)
 	}
+	lockNodes(parent, child)
+	parent.setEntry(name, child)
+	b.mu.Lock()
 
-	// the same node can be looked up through 2 paths in parallel, eg.
-	//
-	//	    root
-	//	    /  \
-	//	  dir1 dir2
-	//	    \  /
-	//	    file
-	//
-	// dir1.Lookup("file") and dir2.Lookup("file") are executed
-	// simultaneously.  The matching StableAttrs ensure that we return the
-	// same node.
-	orig := child
-	id := child.stableAttr
-	if id.Mode & ^(uint32(syscall.S_IFMT)) != 0 {
-		log.Panicf("%#v", id)
+	// Due to concurrent FORGETs, lookupCount may have dropped to zero.
+	// This means it MAY have been deleted from nodes[] already. Add it back.
+	if child.lookupCount == 0 {
+		b.nodes[child.stableAttr.Ino] = child
 	}
-	for {
-		lockNodes(parent, child)
-		b.mu.Lock()
-		if fileFlags&syscall.O_EXCL != 0 {
-			// must create a new node - don't look for existing nodes
-			break
-		}
-		old := b.stableAttrs[id]
-		if old == nil {
-			if child == orig {
-				// no pre-existing node under this inode number
-				break
-			} else {
-				// old inode disappeared while we were looping here. Go back to
-				// original child.
-				b.mu.Unlock()
-				unlockNodes(parent, child)
-				child = orig
-				continue
-			}
-		}
-		if old == child {
-			// we now have the right inode locked
-			break
-		}
-		// found a different existing node
-		b.mu.Unlock()
-		unlockNodes(parent, child)
-		child = old
-	}
-
 	child.lookupCount++
 	child.changeCounter++
 
-	b.kernelNodeIds[child.nodeId] = child
-	// Any node that might be there is overwritten - it is obsolete now
-	b.stableAttrs[id] = child
+	var fh uint32
 	if file != nil {
 		fh = b.registerFile(child, file, fileFlags)
 	}
 
-	parent.setEntry(name, child)
-
-	out.NodeId = child.nodeId
+	out.NodeId = child.stableAttr.Ino
 	out.Generation = child.stableAttr.Gen
 	out.Attr.Ino = child.stableAttr.Ino
 
 	b.mu.Unlock()
 	unlockNodes(parent, child)
-
-	return child, fh
+	return fh
 }
 
 func (b *rawBridge) setEntryOutTimeout(out *fuse.EntryOut) {
@@ -257,8 +231,6 @@ func NewNodeFS(root InodeEmbedder, opts *Options) fuse.RawFileSystem {
 	bridge := &rawBridge{
 		automaticIno: opts.FirstAutomaticIno,
 		server:       opts.ServerCallbacks,
-		nextNodeId:   2, // the root node has nodeid 1
-		stableAttrs:  make(map[StableAttr]*Inode),
 	}
 	if bridge.automaticIno == 1 {
 		bridge.automaticIno++
@@ -278,16 +250,15 @@ func NewNodeFS(root InodeEmbedder, opts *Options) fuse.RawFileSystem {
 
 	initInode(root.embed(), root,
 		StableAttr{
-			Ino:  root.embed().StableAttr().Ino,
+			Ino:  1,
 			Mode: fuse.S_IFDIR,
 		},
 		bridge,
 		false,
-		1,
 	)
 	bridge.root = root.embed()
 	bridge.root.lookupCount = 1
-	bridge.kernelNodeIds = map[uint64]*Inode{
+	bridge.nodes = map[uint64]*Inode{
 		1: bridge.root,
 	}
 
@@ -310,7 +281,7 @@ func (b *rawBridge) String() string {
 func (b *rawBridge) inode(id uint64, fh uint64) (*Inode, *fileEntry) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	n, f := b.kernelNodeIds[id], b.files[fh]
+	n, f := b.nodes[id], b.files[fh]
 	if n == nil {
 		log.Panicf("unknown node %d", id)
 	}
@@ -329,8 +300,8 @@ func (b *rawBridge) Lookup(cancel <-chan struct{}, header *fuse.InHeader, name s
 		return errnoToStatus(errno)
 	}
 
-	child, _ = b.addNewChild(parent, name, child, nil, 0, out)
 	child.setEntryOut(out)
+	b.addNewChild(parent, name, child, nil, 0, out)
 	b.setEntryOutTimeout(out)
 	return fuse.OK
 }
@@ -405,8 +376,8 @@ func (b *rawBridge) Mkdir(cancel <-chan struct{}, input *fuse.MkdirIn, name stri
 		log.Panicf("Mkdir: mode must be S_IFDIR (%o), got %o", fuse.S_IFDIR, out.Attr.Mode)
 	}
 
-	child, _ = b.addNewChild(parent, name, child, nil, syscall.O_EXCL, out)
 	child.setEntryOut(out)
+	b.addNewChild(parent, name, child, nil, 0, out)
 	b.setEntryOutTimeout(out)
 	return fuse.OK
 }
@@ -424,8 +395,8 @@ func (b *rawBridge) Mknod(cancel <-chan struct{}, input *fuse.MknodIn, name stri
 		return errnoToStatus(errno)
 	}
 
-	child, _ = b.addNewChild(parent, name, child, nil, syscall.O_EXCL, out)
 	child.setEntryOut(out)
+	b.addNewChild(parent, name, child, nil, 0, out)
 	b.setEntryOutTimeout(out)
 	return fuse.OK
 }
@@ -451,9 +422,8 @@ func (b *rawBridge) Create(cancel <-chan struct{}, input *fuse.CreateIn, name st
 		return errnoToStatus(errno)
 	}
 
-	child, fh := b.addNewChild(parent, name, child, f, input.Flags|syscall.O_CREAT|syscall.O_EXCL, &out.EntryOut)
+	out.Fh = uint64(b.addNewChild(parent, name, child, f, input.Flags|syscall.O_CREAT, &out.EntryOut))
 
-	out.Fh = uint64(fh)
 	out.OpenFlags = flags
 
 	child.setEntryOut(&out.EntryOut)
@@ -564,8 +534,8 @@ func (b *rawBridge) Link(cancel <-chan struct{}, input *fuse.LinkIn, name string
 			return errnoToStatus(errno)
 		}
 
-		child, _ = b.addNewChild(parent, name, child, nil, 0, out)
 		child.setEntryOut(out)
+		b.addNewChild(parent, name, child, nil, 0, out)
 		b.setEntryOutTimeout(out)
 		return fuse.OK
 	}
@@ -581,7 +551,7 @@ func (b *rawBridge) Symlink(cancel <-chan struct{}, header *fuse.InHeader, targe
 			return errnoToStatus(status)
 		}
 
-		child, _ = b.addNewChild(parent, name, child, nil, syscall.O_EXCL, out)
+		b.addNewChild(parent, name, child, nil, 0, out)
 		child.setEntryOut(out)
 		b.setEntryOutTimeout(out)
 		return fuse.OK
@@ -793,7 +763,7 @@ func (b *rawBridge) releaseFileEntry(nid uint64, fh uint64) (*Inode, *fileEntry)
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	n := b.kernelNodeIds[nid]
+	n := b.nodes[nid]
 	var entry *fileEntry
 	if fh > 0 {
 		last := len(n.openFiles) - 1
@@ -872,47 +842,23 @@ func (b *rawBridge) OpenDir(cancel <-chan struct{}, input *fuse.OpenIn, out *fus
 	return fuse.OK
 }
 
-// setStream makes sure `f.dirStream` and associated state variables are set and
-// seeks to offset requested in `input`. Caller must hold `f.mu`.
-// The `eof` return value shows if `f.dirStream` ended before the requested
-// offset was reached.
-func (b *rawBridge) setStream(cancel <-chan struct{}, input *fuse.ReadIn, inode *Inode, f *fileEntry) (errno syscall.Errno, eof bool) {
-	// Get a new directory stream in the following cases:
-	// 1) f.dirStream == nil ............ First READDIR[PLUS] on this file handle.
-	// 2) input.Offset == 0 ............. Start reading the directory again from
-	//                                    the beginning (user called rewinddir(3) or lseek(2)).
-	// 3) input.Offset < f.nextOffset ... Seek back (user called seekdir(3) or lseek(2)).
-	if f.dirStream == nil || input.Offset == 0 || input.Offset < f.dirOffset {
+// setStream sets the directory part of f. Must hold f.mu
+func (b *rawBridge) setStream(cancel <-chan struct{}, input *fuse.ReadIn, inode *Inode, f *fileEntry) syscall.Errno {
+	if f.dirStream == nil || input.Offset == 0 {
 		if f.dirStream != nil {
 			f.dirStream.Close()
 			f.dirStream = nil
 		}
 		str, errno := b.getStream(&fuse.Context{Caller: input.Caller, Cancel: cancel}, inode)
 		if errno != 0 {
-			return errno, false
+			return errno
 		}
 
-		f.dirOffset = 0
 		f.hasOverflow = false
 		f.dirStream = str
 	}
 
-	// Seek forward?
-	for f.dirOffset < input.Offset {
-		f.hasOverflow = false
-		if !f.dirStream.HasNext() {
-			// Seek past end of directory. This is not an error, but the
-			// user will get an empty directory listing.
-			return 0, true
-		}
-		_, errno := f.dirStream.Next()
-		if errno != 0 {
-			return errno, true
-		}
-		f.dirOffset++
-	}
-
-	return 0, false
+	return 0
 }
 
 func (b *rawBridge) getStream(ctx context.Context, inode *Inode) (DirStream, syscall.Errno) {
@@ -934,19 +880,14 @@ func (b *rawBridge) ReadDir(cancel <-chan struct{}, input *fuse.ReadIn, out *fus
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
-
-	errno, eof := b.setStream(cancel, input, n, f)
-	if errno != 0 {
+	if errno := b.setStream(cancel, input, n, f); errno != 0 {
 		return errnoToStatus(errno)
-	} else if eof {
-		return fuse.OK
 	}
 
 	if f.hasOverflow {
 		// always succeeds.
 		out.AddDirEntry(f.overflow)
 		f.hasOverflow = false
-		f.dirOffset++
 	}
 
 	for f.dirStream.HasNext() {
@@ -960,7 +901,6 @@ func (b *rawBridge) ReadDir(cancel <-chan struct{}, input *fuse.ReadIn, out *fus
 			f.hasOverflow = true
 			return errnoToStatus(errno)
 		}
-		f.dirOffset++
 	}
 
 	return fuse.OK
@@ -971,12 +911,8 @@ func (b *rawBridge) ReadDirPlus(cancel <-chan struct{}, input *fuse.ReadIn, out 
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
-
-	errno, eof := b.setStream(cancel, input, n, f)
-	if errno != 0 {
+	if errno := b.setStream(cancel, input, n, f); errno != 0 {
 		return errnoToStatus(errno)
-	} else if eof {
-		return fuse.OK
 	}
 
 	ctx := &fuse.Context{Caller: input.Caller, Cancel: cancel}
@@ -1001,7 +937,6 @@ func (b *rawBridge) ReadDirPlus(cancel <-chan struct{}, input *fuse.ReadIn, out 
 			f.hasOverflow = true
 			return fuse.OK
 		}
-		f.dirOffset++
 
 		// Virtual entries "." and ".." should be part of the
 		// directory listing, but not part of the filesystem tree.
@@ -1018,7 +953,7 @@ func (b *rawBridge) ReadDirPlus(cancel <-chan struct{}, input *fuse.ReadIn, out 
 				entryOut.SetEntryTimeout(*b.options.NegativeTimeout)
 			}
 		} else {
-			child, _ = b.addNewChild(n, e.Name, child, nil, 0, entryOut)
+			b.addNewChild(n, e.Name, child, nil, 0, entryOut)
 			child.setEntryOut(entryOut)
 			b.setEntryOutTimeout(entryOut)
 			if e.Mode&syscall.S_IFMT != child.stableAttr.Mode&syscall.S_IFMT {
