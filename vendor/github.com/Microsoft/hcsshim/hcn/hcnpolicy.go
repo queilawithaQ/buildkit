@@ -19,7 +19,6 @@ const (
 	L4WFPPROXY    EndpointPolicyType = "L4WFPPROXY"
 	PortName      EndpointPolicyType = "PortName"
 	EncapOverhead EndpointPolicyType = "EncapOverhead"
-	IOV           EndpointPolicyType = "Iov"
 	// Endpoint and Network have InterfaceConstraint and ProviderAddress
 	NetworkProviderAddress     EndpointPolicyType = "ProviderAddress"
 	NetworkInterfaceConstraint EndpointPolicyType = "InterfaceConstraint"
@@ -48,7 +47,6 @@ const (
 	HostRoute           NetworkPolicyType = "HostRoute"
 	SetPolicy           NetworkPolicyType = "SetPolicy"
 	NetworkL4Proxy      NetworkPolicyType = "L4Proxy"
-	LayerConstraint     NetworkPolicyType = "LayerConstraint"
 )
 
 // NetworkPolicy is a collection of Policy settings for a Network.
@@ -156,10 +154,9 @@ type FiveTuple struct {
 
 // L4WfpProxyPolicySetting sets Layer-4 Proxy on an endpoint.
 type L4WfpProxyPolicySetting struct {
-	InboundProxyPort  string    `json:",omitempty"`
-	OutboundProxyPort string    `json:",omitempty"`
-	FilterTuple       FiveTuple `json:",omitempty"`
-	UserSID           string    `json:",omitempty"`
+	Port        string    `json:",omitempty"`
+	FilterTuple FiveTuple `json:",omitempty"`
+	UserSID     string    `json:",omitempty"`
 }
 
 // PortnameEndpointPolicySetting sets the port name for an endpoint.
@@ -170,13 +167,6 @@ type PortnameEndpointPolicySetting struct {
 // EncapOverheadEndpointPolicySetting sets the encap overhead for an endpoint.
 type EncapOverheadEndpointPolicySetting struct {
 	Overhead uint16 `json:",omitempty"`
-}
-
-// IovPolicySetting sets the Iov settings for an endpoint.
-type IovPolicySetting struct {
-	IovOffloadWeight    uint32 `json:",omitempty"`
-	QueuePairsRequested uint32 `json:",omitempty"`
-	InterruptModeration uint32 `json:",omitempty"`
 }
 
 /// Endpoint and Network Policy objects
@@ -222,10 +212,6 @@ type DrMacAddressNetworkPolicySetting struct {
 // AutomaticDNSNetworkPolicySetting enables/disables automatic DNS on a network.
 type AutomaticDNSNetworkPolicySetting struct {
 	Enable bool `json:",omitempty"`
-}
-
-type LayerConstraintNetworkPolicySetting struct {
-	LayerId string `json:",omitempty"`
 }
 
 /// Subnet Policy objects
