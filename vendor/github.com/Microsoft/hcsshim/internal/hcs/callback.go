@@ -106,7 +106,6 @@ func newSystemChannels() notificationChannels {
 		hcsNotificationSystemStartCompleted,
 		hcsNotificationSystemPauseCompleted,
 		hcsNotificationSystemResumeCompleted,
-		hcsNotificationSystemSaveCompleted,
 	} {
 		channels[notif] = make(notificationChannel, 1)
 	}

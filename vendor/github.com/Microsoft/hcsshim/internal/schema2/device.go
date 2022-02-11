@@ -13,8 +13,8 @@ type DeviceType string
 
 const (
 	ClassGUID      DeviceType = "ClassGuid"
-	DeviceInstance DeviceType = "DeviceInstance"
-	GPUMirror      DeviceType = "GpuMirror"
+	DeviceInstance            = "DeviceInstance"
+	GPUMirror                 = "GpuMirror"
 )
 
 type Device struct {
