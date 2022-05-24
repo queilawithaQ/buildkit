@@ -52,12 +52,13 @@ func ResultFromError(err error) Result {
 }
 
 type templatedResult struct {
+	success  bool
 	template string
 	data     map[string]interface{}
 }
 
 func (r templatedResult) Success() bool {
-	return false
+	return r.success
 }
 
 func (r templatedResult) FailureMessage(args []ast.Expr) string {
